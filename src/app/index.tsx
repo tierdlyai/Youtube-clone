@@ -17,6 +17,8 @@ import {
   useWindowDimensions,
   NativeSyntheticEvent,
   NativeScrollEvent,
+  type LayoutChangeEvent,
+  type TextLayoutEvent,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { MaterialCommunityIcons as Icon } from '@expo/vector-icons';
@@ -141,13 +143,37 @@ const pickImage = async (aspect: [number, number]) => {
   return `data:image/jpeg;base64,${res.assets[0].base64}`;
 };
 
+type Saved = { data: Data | null; avatar: string | null; thumb: string | null };
+
+const readSaved = async (): Promise<Saved> => {
+  try {
+    const rows = await AsyncStorage.multiGet([K_DATA, K_AVATAR, K_THUMB]);
+    const [d, a, t] = rows.map((r) => r[1]);
+    let parsed: Data | null = null;
+    if (d) {
+      try {
+        const p = JSON.parse(d);
+        parsed = { ...DEFAULTS, ...p, video: { ...DEFAULTS.video, ...(p.video ?? {}) } };
+      } catch {}
+    }
+    return { data: parsed, avatar: a ?? null, thumb: t ?? null };
+  } catch {
+    return { data: null, avatar: null, thumb: null };
+  }
+};
+
 /* ---------- AdMob (rewarded) ---------- */
 
-// Loaded safely so the app still runs in Expo Go (where ads aren't available)
-let Ads: any = null;
-try {
-  Ads = require('react-native-google-mobile-ads');
-} catch {}
+type AdsModule = any;
+
+// Loaded via dynamic import so the app still runs in Expo Go,
+// where the ads native module isn't available. Memoised so both
+// rewarded hooks share one import.
+let adsPromise: Promise<AdsModule | null> | null = null;
+const loadAds = () => {
+  adsPromise ??= import('react-native-google-mobile-ads').catch(() => null);
+  return adsPromise;
+};
 
 // Ad 1: unlocks "Randomize everything" on the Edit screen
 const AD1_REAL = 'ca-app-pub-8575196128182596/8304850019';
@@ -156,14 +182,27 @@ const AD1_REAL = 'ca-app-pub-8575196128182596/8304850019';
 const AD2_REAL = 'ca-app-pub-8575196128182596/8304850019';
 
 // Test ads while developing, your real ad units in release builds
-const adUnit = (real: string) => (__DEV__ && Ads ? Ads.TestIds.REWARDED : real);
+const adUnit = (Ads: AdsModule, real: string) => (__DEV__ && Ads ? Ads.TestIds.REWARDED : real);
 
 const useRewardedAd = (unitId: string, onReward: () => void) => {
   const [ready, setReady] = useState(false);
+  const [Ads, setAds] = useState<AdsModule | null>(null);
   const adRef = useRef<any>(null);
   const rewardRef = useRef(onReward);
-  rewardRef.current = onReward;
-  const available = !!Ads;
+
+  useEffect(() => {
+    let alive = true;
+    loadAds().then((m) => {
+      if (alive) setAds(m);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    rewardRef.current = onReward;
+  }, [onReward]);
 
   useEffect(() => {
     if (!Ads) return;
@@ -172,7 +211,7 @@ const useRewardedAd = (unitId: string, onReward: () => void) => {
 
     try {
       Ads.default().initialize().catch(() => {});
-      const ad = Ads.RewardedAd.createForAdRequest(adUnit(unitId), {
+      const ad = Ads.RewardedAd.createForAdRequest(adUnit(Ads, unitId), {
         requestNonPersonalizedAdsOnly: true,
       });
       adRef.current = ad;
@@ -196,7 +235,9 @@ const useRewardedAd = (unitId: string, onReward: () => void) => {
       unsubs.forEach((u) => u());
       if (retry) clearTimeout(retry);
     };
-  }, []);
+  }, [Ads, unitId]);
+
+  const available = !!Ads;
 
   const showAd = () => {
     if (!adRef.current || !ready) {
@@ -239,17 +280,65 @@ const RScroll = (props: React.ComponentProps<typeof ScrollView>) => {
   );
 };
 
+type FittedProps = React.ComponentProps<typeof Text> & { minScale?: number };
+
+// adjustsFontSizeToFit is declared in TextPropsIOS but only implemented on iOS,
+// so on Android a clamped <Text> just truncates. Measure the natural width with a
+// hidden unclamped copy and shrink the font until the text fits its box.
+const FittedText = ({ children, style, minScale = 0.55, ...rest }: FittedProps) => {
+  const [scale, setScale] = useState(1);
+  const box = useRef(0);
+  const tries = useRef(0);
+
+  const measurable = typeof children === 'string' || typeof children === 'number';
+
+  const onLayout = (e: LayoutChangeEvent) => {
+    const w = e.nativeEvent.layout.width;
+    if (w > 0 && Math.abs(w - box.current) > 0.5) {
+      box.current = w;
+      tries.current = 0;
+      setScale(1);
+    }
+  };
+
+  // Only ever shrinks, and gives up after a few rounds, so this converges.
+  const onTextLayout = (e: TextLayoutEvent) => {
+    const avail = box.current;
+    if (!avail || tries.current >= 5) return;
+    const natural = e.nativeEvent.lines.reduce((m, l) => Math.max(m, l.width), 0);
+    if (natural <= 0 || natural <= avail) return;
+    tries.current += 1;
+    setScale((prev) => Math.max(minScale, prev * (avail / natural) * 0.98));
+  };
+
+  const base = StyleSheet.flatten(style)?.fontSize;
+  const sized = typeof base === 'number' && scale !== 1 ? { fontSize: base * scale } : null;
+
+  return (
+    <>
+      <Text {...rest} onLayout={onLayout} numberOfLines={rest.numberOfLines ?? 1} adjustsFontSizeToFit style={[style, sized]}>
+        {children}
+      </Text>
+      {measurable && Platform.OS === 'android' && (
+        <Text onTextLayout={onTextLayout} style={[style, sized, s.fittedGhost]}>
+          {children}
+        </Text>
+      )}
+    </>
+  );
+};
+
 // Small fade + rise animation
 const FadeIn = ({ children }: { children: React.ReactNode }) => {
-  const opacity = useRef(new Animated.Value(0)).current;
-  const y = useRef(new Animated.Value(8)).current;
+  const [opacity] = useState(() => new Animated.Value(0));
+  const [y] = useState(() => new Animated.Value(8));
 
   useEffect(() => {
     Animated.parallel([
       Animated.timing(opacity, { toValue: 1, duration: 450, useNativeDriver: true }),
       Animated.timing(y, { toValue: 0, duration: 450, useNativeDriver: true }),
     ]).start();
-  }, []);
+  }, [opacity, y]);
 
   return (
     <Animated.View style={{ flex: 1, opacity, transform: [{ translateY: y }] }}>
@@ -315,7 +404,7 @@ const StatCard = ({
   <Pressable onPress={onPress} style={({ pressed }) => [s.statCard, pressed && { opacity: 0.6 }]}>
     <Text style={s.statLabel}>{label}</Text>
     <View style={s.statRow}>
-      <Text style={s.statValue} numberOfLines={1} adjustsFontSizeToFit>{value}</Text>
+      <FittedText style={s.statValue} numberOfLines={1}>{value}</FittedText>
       <Icon name={icon} size={20} color={color} />
     </View>
   </Pressable>
@@ -358,7 +447,7 @@ const Dashboard = ({ go, data, imgs }: { go: (t: TabKey) => void; data: Data; im
         </View>
         <View style={{ flex: 1 }}>
           <Text style={s.channelName} numberOfLines={1}>{data.name}</Text>
-          <Text style={s.subCount} numberOfLines={1} adjustsFontSizeToFit>{fmt(data.subs)}</Text>
+          <FittedText style={s.subCount} numberOfLines={1}>{fmt(data.subs)}</FittedText>
           <Text style={s.subLabel}>Total subscribers</Text>
         </View>
       </View>
@@ -661,15 +750,15 @@ const Earn = ({ data, adAvailable, adReady, unlocked, open, onPayPress }: EarnPr
 
   return (
     <RScroll contentContainerStyle={s.scroll}>
-      <Text style={s.partnerTitle}>You're a YouTube Partner</Text>
+      <Text style={s.partnerTitle}>You&apos;re a YouTube Partner</Text>
 
       <View style={s.bigCard}>
         <Text style={s.hint}>A payment is headed your way!</Text>
         <Text style={s.hint}>Expect a payment between {month} 21–23</Text>
-        <Text style={s.payAmount} numberOfLines={1} adjustsFontSizeToFit>{amount}</Text>
+        <FittedText style={s.payAmount} numberOfLines={1}>{amount}</FittedText>
         <View style={s.divider} />
         <Text style={s.hint}>{month} earnings</Text>
-        <Text style={s.earnings} numberOfLines={1} adjustsFontSizeToFit>{amount}</Text>
+        <FittedText style={s.earnings} numberOfLines={1}>{amount}</FittedText>
         <Text style={s.hint}>Payment estimates may vary</Text>
       </View>
 
@@ -696,7 +785,7 @@ const Earn = ({ data, adAvailable, adReady, unlocked, open, onPayPress }: EarnPr
         </View>
       )}
 
-      <Text style={[s.sectionTitle, { marginTop: 24 }]}>What you're using</Text>
+      <Text style={[s.sectionTitle, { marginTop: 24 }]}>What you&apos;re using</Text>
       {[
         { icon: 'play-circle' as IconName, label: 'Watch page ads', color: C.blue },
         { icon: 'lightning-bolt' as IconName, label: 'Shorts feed ads', color: '#FF8A3D' },
@@ -733,10 +822,12 @@ const NumField = ({
   hint?: string;
 }) => {
   const [text, setText] = useState(String(value));
+  const [syncedValue, setSyncedValue] = useState(value);
 
-  useEffect(() => {
+  if (value !== syncedValue) {
+    setSyncedValue(value);
     if (parseNum(text) !== value) setText(String(value));
-  }, [value]);
+  }
 
   return (
     <View style={s.field}>
@@ -957,23 +1048,18 @@ export default function Index() {
     else ad2.showAd();
   };
 
-  const loadSaved = async () => {
-    try {
-      const rows = await AsyncStorage.multiGet([K_DATA, K_AVATAR, K_THUMB]);
-      const [d, a, t] = rows.map((r) => r[1]);
-      if (d) {
-        try {
-          const p = JSON.parse(d);
-          setData({ ...DEFAULTS, ...p, video: { ...DEFAULTS.video, ...(p.video ?? {}) } });
-        } catch {}
-      }
-      setImgs({ avatar: a ?? null, thumb: t ?? null });
-    } catch {}
-  };
-
   // Load saved data
   useEffect(() => {
-    loadSaved().finally(() => setLoaded(true));
+    let alive = true;
+    readSaved().then((r) => {
+      if (!alive) return;
+      if (r.data) setData(r.data);
+      setImgs({ avatar: r.avatar, thumb: r.thumb });
+      setLoaded(true);
+    });
+    return () => {
+      alive = false;
+    };
   }, []);
 
   // Auto-save
@@ -1007,7 +1093,9 @@ export default function Index() {
 
   const onRefresh = async () => {
     setRefreshing(true);
-    await Promise.all([loadSaved(), new Promise<void>((r) => setTimeout(r, 700))]);
+    const [r] = await Promise.all([readSaved(), new Promise<void>((res) => setTimeout(res, 700))]);
+    if (r.data) setData(r.data);
+    setImgs({ avatar: r.avatar, thumb: r.thumb });
     setRefreshKey((k) => k + 1);
     setRefreshing(false);
   };
@@ -1113,6 +1201,8 @@ export default function Index() {
 const s = StyleSheet.create({
   safe: { flex: 1, backgroundColor: C.bg },
   scroll: { padding: 16, paddingBottom: 32 },
+
+  fittedGhost: { position: 'absolute', opacity: 0 },
 
   topBar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 12 },
   logoRow: { flexDirection: 'row', alignItems: 'center' },
